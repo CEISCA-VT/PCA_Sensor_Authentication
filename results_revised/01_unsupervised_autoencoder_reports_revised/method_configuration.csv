@@ -1,0 +1,2 @@
+Method,Epochs,Learning_Rate,Weight_Decay,Reconstruction_Weight,Balance_Weight,Decorrelation_Weight,Quantization_Weight,Hidden_Widths,Seeds,Frequency_Start_Hz,Frequency_End_Hz,Frequency_Points,Use_Phase
+unsupervised reconstruction autoencoder,100,0.001,0.0001,1.0,0.05,0.01,0.01,"(256, 128)","[20260903, 20260904, 20260905]",10000,1000000,2001,True
