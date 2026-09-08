@@ -1,0 +1,51 @@
+﻿{
+    "RunName":  "run_20260907_190055",
+    "StartedAt":  "2026-09-07T19:01:30.0660671-04:00",
+    "CompletedAt":  "2026-09-07T19:58:49.1560462-04:00",
+    "DurationMinutes":  57.318,
+    "PythonExecutable":  "C:\\Users\\shrey\\miniconda3\\python.exe",
+    "PythonVersion":  "Python 3.12.9",
+    "DatasetDirectory":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\01_master_dataset",
+    "SourceDirectory":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main",
+    "SelectedScripts":  {
+                            "final_pca.py":  {
+                                                 "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\final_pca.py",
+                                                 "SHA256":  "43EECD88DBE04A604FF8CF4C191DDDCE1F0A02B31BDD57DE723F7C8D2A396884"
+                                             },
+                            "two_stage.py":  {
+                                                 "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\two_stage.py",
+                                                 "SHA256":  "EDF23AE540F2919E831E7795DDBAB8ABC328944CD49529DDB324ACDA60B9E299"
+                                             },
+                            "ds_pqm.py":  {
+                                              "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\ds_pqm.py",
+                                              "SHA256":  "5D0F98AB5E674F7246835BF69F35B1490B17231DD7AC41FE07D50CB91C456BA8"
+                                          },
+                            "kpca.py":  {
+                                            "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\kpca.py",
+                                            "SHA256":  "7C82D0B9A67F6746B4BC73FFF76A9F95B2755997E2D015C7B1D2EC3F020467AF"
+                                        },
+                            "supervised.py":  {
+                                                  "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\supervised.py",
+                                                  "SHA256":  "2E9BFFA2255F97A63EDB9487C7FAE38D1D72278B57B32538F4DC677DFDF6E00B"
+                                              },
+                            "unsup.py":  {
+                                             "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\unsup.py",
+                                             "SHA256":  "E2B294A4928CCCF739BC0616143B70E42BC18C56A99FC5B1D333693D2CE62970"
+                                         },
+                            "consolidate_nonlinear_comparison.py":  {
+                                                                        "SourceFile":  "C:\\Users\\shrey\\Documents\\PCA_Framework-main\\consolidate_nonlinear_comparison.py",
+                                                                        "SHA256":  "057D8D6880DACE71A8820C36D26D39D4E46249278C755EDA5BBFBCB3B431CFB7"
+                                                                    }
+                        },
+    "Validation":  {
+                       "PCAProtocols":  [
+                                            "enrolled_cohort",
+                                            "heldout_sensor_cohort"
+                                        ],
+                       "PCASummaryRows":  12,
+                       "ScalarBaselineRows":  6,
+                       "LinearPCAComparisonRows":  4,
+                       "AutoencoderAggregateRows":  4,
+                       "Status":  "PASS"
+                   }
+}
