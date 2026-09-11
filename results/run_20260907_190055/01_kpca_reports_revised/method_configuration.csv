@@ -1,2 +1,0 @@
-Kernel,Gamma,Degree,Coef0,Eigen_Solver,Frequency_Start_Hz,Frequency_End_Hz,Frequency_Points,Use_Phase,Sweep_Indices,Random_Seed
-rbf,0.0002498750624687656,3,1.0,auto,10000,1000000,2001,True,"1,2,3,4,5",20260903

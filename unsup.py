@@ -95,13 +95,14 @@ def fit_model(panel, training_indices, bit_length, seed):
             rows.append(common.load_sweep_vector(panel[device][index]))
             device_labels.append(device)
     matrix = np.vstack(rows)
+    started = perf_counter()
     scaler = common.StandardScaler().fit(matrix)
     inputs = torch.tensor(scaler.transform(matrix), dtype=torch.float32)
     model = UnsupervisedAutoencoder(matrix.shape[1], bit_length)
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE,
                            weight_decay=WEIGHT_DECAY)
     mse = nn.MSELoss()
-    started = perf_counter()
+    
     model.train()
     last_losses = None
     for _ in range(EPOCHS):

@@ -25,12 +25,12 @@ DEVICE_FOLDER = r"./01_master_dataset"
 REPORT_DIR = r"./01_scalar_pqm_reports_revised"
 
 START_FREQ_HZ = 10_000
-END_FREQ_HZ = 1_000_000
+END_FREQ_HZ = 1_00_000
 N_FREQ_POINTS = 2_001
 REFERENCE_FREQUENCIES_HZ = np.linspace(START_FREQ_HZ, END_FREQ_HZ, N_FREQ_POINTS)
 
 CV_SWEEP_INDICES = [1, 2, 3, 4, 5]
-EXCLUDED_DEVICES = {"201", "253", "254", "258", "310"}
+EXCLUDED_DEVICES = {}
 MIN_DEVICES = 2
 
 # Natural scalar-code lengths: 3 physical features times 4, 6, or 8 bits each.
@@ -582,7 +582,7 @@ def run():
     print(f"Evaluated devices: {len(panel)}")
     print(f"Explicitly excluded devices: {sorted(EXCLUDED_DEVICES)}")
     print(f"Incomplete-panel devices removed: {incomplete}")
-    print("Interpolation: linear onto the common 10-1000 kHz grid")
+    print("Interpolation: linear onto the common 10-100 kHz grid")
     print("Artificial repetition to 64/128 bits: DISABLED")
 
     aggregate_rows, fold_rows, query_frames, per_device_frames, identifier_rows = (

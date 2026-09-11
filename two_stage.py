@@ -1,5 +1,6 @@
 """Two-stage spectral optimization with common-grid interpolation.
 
+Evaluation is restricted to 10--100 kHz, even if raw files cover a wider band.
 Stage 1 compares candidate frequency windows at the same target point count.
 Stage 2 reduces the target point count inside the best Stage-1 windows. For
 every configuration, each measured sweep is linearly interpolated onto the
@@ -24,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 
 # Configuration
 DEVICE_FOLDER = r"./01_master_dataset"
-REPORT_DIR = r"./01_256reports_optimization_revised"
+REPORT_DIR = r"./01_256reports_optimization_10_100khz"
 
 USE_PHASE = True
 ID_BIT_LENGTHS = [64, 128, 256]
@@ -37,13 +38,13 @@ MIN_DEVICES = 2
 
 STAGE1_N_POINTS = 500
 TOP_K_WINDOWS = 3
+MIN_ANALYSIS_FREQ_HZ = 10_000
+MAX_ANALYSIS_FREQ_HZ = 100_000
 CANDIDATE_WINDOWS = [
-    (10_000, 1_000_000),
     (10_000, 100_000),
     (20_000, 35_000),
     (60_000, 100_000),
     (80_000, 95_000),
-    (100_000, 1_000_000),
 ]
 STAGE2_N_POINTS = [400, 300, 250, 200, 150, 128, 100, 64, 50, 32, 25, 10]
 
@@ -224,6 +225,8 @@ def validate_panel_sweeps(device_files, sweep_indices):
 
 # Interpolation and PCA
 def make_reference_grid(start_hz, end_hz, n_points):
+    if not MIN_ANALYSIS_FREQ_HZ <= start_hz < end_hz <= MAX_ANALYSIS_FREQ_HZ:
+        raise ValueError("Frequency windows must lie within 10--100 kHz")
     if n_points < 2:
         raise ValueError("At least two target frequency points are required")
     if GRID_SPACING == "log":
@@ -731,6 +734,9 @@ def append_details(
 
 
 def main():
+    for start_hz, end_hz in CANDIDATE_WINDOWS:
+        make_reference_grid(start_hz, end_hz, STAGE1_N_POINTS)
+    print("Analysis range: 10--100 kHz; wider raw acquisition is not evaluated")
     device_files = collect_device_files(DEVICE_FOLDER)
     if not device_files:
         raise RuntimeError(f"No sweep CSV files were found in {DEVICE_FOLDER}")
@@ -756,9 +762,7 @@ def main():
         for start_hz, end_hz in CANDIDATE_WINDOWS:
             window = f"{start_hz // 1000}k-{end_hz // 1000}k"
             heatmap_path = None
-            if bit_length == 128 and (start_hz, end_hz) in (
-                (10_000, 100_000), (10_000, 1_000_000)
-            ):
+            if bit_length == 128 and (start_hz, end_hz) == (10_000, 100_000):
                 heatmap_path = os.path.join(
                     REPORT_DIR, f"Correlation_Heatmap_{window}_{bit_length}b.png"
                 )

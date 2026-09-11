@@ -100,6 +100,7 @@ def fit_model(panel, training_indices, bit_length, seed):
             labels.append(label_index[device])
             device_labels.append(device)
     matrix = np.vstack(rows)
+    started = perf_counter()
     scaler = common.StandardScaler().fit(matrix)
     inputs = torch.tensor(scaler.transform(matrix), dtype=torch.float32)
     targets = torch.tensor(labels, dtype=torch.long)
@@ -107,7 +108,7 @@ def fit_model(panel, training_indices, bit_length, seed):
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE,
                            weight_decay=WEIGHT_DECAY)
     mse, cross_entropy = nn.MSELoss(), nn.CrossEntropyLoss()
-    started = perf_counter()
+    
     model.train()
     last_losses = None
     for _ in range(EPOCHS):

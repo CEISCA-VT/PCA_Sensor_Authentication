@@ -1,868 +1,430 @@
-"""Leakage-free single- and multi-sweep PCA authentication evaluation.
 
-Every sweep is linearly interpolated onto one common, linearly spaced frequency
-grid. Evaluation uses a complete device-by-sweep panel, so the same devices are
-present in every fold and excluded devices never enter PCA or the template bank.
-
-Single-sweep evaluation uses every ordered pair of distinct sweep indices: one
-sweep for enrollment and a different sweep for authentication. Multi-sweep
-evaluation is leave-one-sweep-out: PCA and enrollment use all remaining sweeps,
-and the held-out sweep is used only for authentication.
-"""
-
-import csv
-import gzip
 import os
-from collections import defaultdict
 from time import perf_counter
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from collections import defaultdict, Counter
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
 
+# ---------------------------
+# CONFIG
+# ---------------------------
+DEVICE_FOLDER = r"./01_master_dataset"    # folder with CSV sweeps
+REPORT_DIR   = r"./01_256reports_revised"    # folder for outputs
 
-# Configuration
-DEVICE_FOLDER = r"./01_master_dataset"
-REPORT_DIR = r"./01_256reports_revised"
+PREFERRED_REG_INDEX_SINGLE = 1
+PREFERRED_AUTH_INDEX_SINGLE = 2
+PREFERRED_MULTI_TRAIN_INDICES = list(range(4,7))
+PREFERRED_MULTI_AUTH_INDEX = 5
 
-USE_PHASE = True
-ID_BIT_LENGTHS = [64, 128, 256]
-START_FREQ_HZ = 10_000
-END_FREQ_HZ = 1_000_000
-N_FREQ_POINTS = 2_001
-REFERENCE_FREQUENCIES_HZ = np.linspace(
-    START_FREQ_HZ, END_FREQ_HZ, N_FREQ_POINTS
-)
+USE_PHASE     = True
+ID_BIT_LENGTH = 128
+START_FREQ    = 10000
+END_FREQ      = 100000
+N_FREQ_POINTS = 2001
+REF_FREQ      = np.linspace(START_FREQ, END_FREQ, N_FREQ_POINTS)
 
-# None discovers every repeated-sweep index in the complete panel. Set an
-# explicit list (for example [1, 2, 3, 4, 5]) to match the manuscript exactly.
-CV_SWEEP_INDICES = [1, 2, 3, 4, 5]
-EXCLUDED_DEVICES = {"201", "253", "254", "258", "310"}
-MIN_DEVICES = 2
-
-# Fix these before examining the held-out comparisons. Replace them only with
-# values selected using a separate development set or a protocol-level rule.
-FIXED_AUTH_THRESHOLDS = {64: 8, 128: 14, 256: 25}
-
-BOOTSTRAP_REPEATS = 2_000
-BOOTSTRAP_SEED = 20_260_903
-PCA_RANDOM_SEED = 20_260_903
-EXPORT_DIRECTED_COMPARISONS = True
-ENABLE_SENSOR_COHORT_SPLIT = True
-SENSOR_COHORT_TEST_FRACTION = 0.10
-SENSOR_COHORT_SPLIT_SEED = 20_260_903
+# ---------------------------
+# CUSTOM CONTROLS
+# ---------------------------
+EXCLUDED_DEVICES = ["201", "253", "254", "258", "310"]          # e.g., ["dev2", "bad_device_7"]
+HAMMING_AUTH_THRESHOLD = 25    # maximum acceptable intra-distance for valid authentication
 
 os.makedirs(REPORT_DIR, exist_ok=True)
-SWEEP_CACHE = {}
-_CURRENT_BIT_LENGTH_FOR_NORMALIZATION = None
 
+# ---------------------------
+# Utilities
+# ---------------------------
 
-# Data loading and alignment
-def _normalise_name(value):
-    value = str(value).replace("θ", "theta").replace("Θ", "theta")
-    return " ".join(value.strip().lower().split())
-
-
-def _find_column(frame, aliases):
-    names = {_normalise_name(column): column for column in frame.columns}
-    return next((names[name] for name in aliases if name in names), None)
-
-
-def _extract_candidate(frame):
-    if frame.shape[1] < 2:
-        raise ValueError("fewer than two columns")
-
-    frequency_column = _find_column(frame, ("frequency", "freq", "f"))
-    impedance_column = _find_column(
-        frame,
-        ("trace |z| (ohm)", "impedance", "trace |z|", "|z|", "imp", "z"),
-    )
-    phase_column = _find_column(
-        frame, ("trace th (deg)", "phase", "angle", "theta", "th")
-    )
-    normalised = {_normalise_name(column): column for column in frame.columns}
-    if impedance_column is None:
-        impedance_column = next(
-            (
-                column
-                for name, column in normalised.items()
-                if "impedance" in name or "|z|" in name or "magnitude" in name
-            ),
-            None,
-        )
-    if phase_column is None:
-        phase_column = next(
-            (
-                column
-                for name, column in normalised.items()
-                if "phase" in name or "angle" in name or "theta" in name
-            ),
-            None,
-        )
-
-    # Numeric fallback supports simple two/three-column CSV files. The parser
-    # later selects the variant with the largest valid sweep.
-    frequency_column = frequency_column or frame.columns[0]
-    impedance_column = impedance_column or frame.columns[1]
-
-    frequency = pd.to_numeric(frame[frequency_column], errors="coerce").to_numpy(float)
-    impedance = pd.to_numeric(frame[impedance_column], errors="coerce").to_numpy(float)
-    phase = (
-        pd.to_numeric(frame[phase_column], errors="coerce").to_numpy(float)
-        if phase_column is not None
-        else None
-    )
-    valid = np.isfinite(frequency) & np.isfinite(impedance)
-    if phase is not None:
-        valid &= np.isfinite(phase)
-    return frequency[valid], phase[valid] if phase is not None else None, impedance[valid]
-
-
-def load_raw_sweep(path, use_phase=USE_PHASE):
-    key = (path, use_phase)
-    if key in SWEEP_CACHE:
-        return SWEEP_CACHE[key]
-
-    candidates = []
-    errors = []
-    for kwargs in ({"skiprows": 32}, {"skiprows": 33}, {"skiprows": 1}, {}):
+def robust_load_csv_try_variants(path):
+    for var in [{"skiprows":32}, {"skiprows":33}, {"skiprows":1}, {}]:
         try:
-            frame = pd.read_csv(path, **kwargs)
-            frequency, phase, impedance = _extract_candidate(frame)
-            if len(frequency) >= 2:
-                candidates.append((frequency, phase, impedance))
-        except Exception as exc:
-            errors.append(str(exc))
-    if not candidates:
-        raise ValueError(f"Could not find a numeric sweep in {path}: {errors[-1:]}")
+            df = pd.read_csv(path, **var)
+            return df
+        except: continue
+    return pd.read_csv(path)
 
-    frequency, phase, impedance = max(candidates, key=lambda values: len(values[0]))
-    order = np.argsort(frequency)
-    frequency, impedance = frequency[order], impedance[order]
-    phase = phase[order] if phase is not None else None
+def extract_columns_from_df(df, use_phase=False):
+    cols_map = {c.lower(): c for c in df.columns}
+    freq_col = next((cols_map[c] for c in ["frequency", "freq", "f"] if c in cols_map), df.columns[0])
+    imp_col  = next((cols_map[c] for c in ["trace |z| (ohm)", "impedance", "trace |z|", "|z|", "imp", "z"] if c in cols_map), df.columns[1])
+    phase_col = None
+    if use_phase:
+        phase_col = next((cols_map[c] for c in ["trace th (deg)", "phase", "angle", "th"] if c in cols_map), None)
+    freq  = df[freq_col].values
+    imp   = df[imp_col].values
+    phase = df[phase_col].values if (use_phase and phase_col) else None
+    return freq, phase, imp
 
-    if np.any(np.diff(frequency) <= 0):
-        raise ValueError(f"Frequency values must be unique and increasing in {path}")
-    if use_phase and phase is None:
-        raise ValueError(
-            f"Phase is enabled but no phase column was found in {path}. "
-            "Set USE_PHASE=False for a magnitude-only experiment; missing phase "
-            "must not be replaced by zeros."
-        )
-
-    SWEEP_CACHE[key] = (frequency, phase, impedance)
-    return SWEEP_CACHE[key]
-
-
-def load_sweep_vector(path, reference_frequencies=REFERENCE_FREQUENCIES_HZ):
-    frequency, phase, impedance = load_raw_sweep(path)
-    tolerance = max(1e-6, 1e-9 * reference_frequencies[-1])
-    if (
-        reference_frequencies[0] < frequency[0] - tolerance
-        or reference_frequencies[-1] > frequency[-1] + tolerance
-    ):
-        raise ValueError(
-            f"{path} covers {frequency[0]:.3f}-{frequency[-1]:.3f} Hz, which "
-            f"does not cover the requested grid {reference_frequencies[0]:.3f}-"
-            f"{reference_frequencies[-1]:.3f} Hz"
-        )
-
-    impedance_aligned = np.interp(reference_frequencies, frequency, impedance)
-    if USE_PHASE:
-        phase_aligned = np.interp(reference_frequencies, frequency, phase)
-        return np.concatenate((phase_aligned, impedance_aligned))
-    return impedance_aligned
-
+def load_sweep_vector(path, ref_freq=REF_FREQ, use_phase=USE_PHASE):
+    df = robust_load_csv_try_variants(path)
+    freq, phase, imp = extract_columns_from_df(df, use_phase)
+    if freq[0] > freq[-1]:
+        freq, imp = freq[::-1], imp[::-1]
+        if phase is not None: phase = phase[::-1]
+    imp_interp = np.interp(ref_freq, freq, imp)
+    if use_phase:
+        phase_interp = np.zeros_like(ref_freq) if phase is None else np.interp(ref_freq, freq, phase)
+        return np.concatenate([phase_interp, imp_interp])
+    return imp_interp
 
 def collect_device_files(folder):
     device_files = defaultdict(dict)
-    for filename in sorted(os.listdir(folder)):
-        if not filename.lower().endswith(".csv"):
-            continue
-        stem = os.path.splitext(filename)[0]
-        if "_" not in stem:
-            continue
-        device, index_text = stem.rsplit("_", 1)
-        try:
-            index = int(index_text)
-        except ValueError:
-            continue
-        device_files[device][index] = os.path.join(folder, filename)
-    return dict(device_files)
+    for fname in sorted(os.listdir(folder)):
+        if not fname.lower().endswith(".csv"): continue
+        name = os.path.splitext(fname)[0]
+        if "_" not in name: continue
+        prefix, idx = name.rsplit("_", 1)
+        try: idx_int = int(idx)
+        except: continue
+        device_files[prefix][idx_int] = os.path.join(folder, fname)
+    return device_files
 
+def choose_pca_components(X_rows, X_cols, desired_bits=ID_BIT_LENGTH):
+    return max(1, min(desired_bits, X_rows, X_cols))
 
-def prepare_complete_panel(device_files):
-    retained = {
-        device: files
-        for device, files in device_files.items()
-        if device not in EXCLUDED_DEVICES
-    }
-    if not retained:
-        raise RuntimeError("No devices remain after exclusions")
+def binary_from_projection(proj, bits):
+    return ''.join('1' if x > 0 else '0' for x in proj[:bits])
 
-    counts = defaultdict(int)
-    for files in retained.values():
-        for index in files:
-            counts[index] += 1
-    if CV_SWEEP_INDICES is None:
-        indices = sorted(index for index, count in counts.items() if count >= MIN_DEVICES)
-    else:
-        indices = sorted(set(CV_SWEEP_INDICES))
-        missing = [index for index in indices if index not in counts]
-        if missing:
-            raise RuntimeError(f"Configured sweep indices were not found: {missing}")
-    if len(indices) < 2:
-        raise RuntimeError("At least two sweep indices are required")
+def hamming_distance(a, b):
+    if a is None or b is None: return None
+    if len(a)!=len(b):
+        L=max(len(a),len(b))
+        a=a.ljust(L,"0"); b=b.ljust(L,"0")
+    return sum(x!=y for x,y in zip(a,b))
 
-    complete = {
-        device: files
-        for device, files in retained.items()
-        if all(index in files for index in indices)
-    }
-    if len(complete) < MIN_DEVICES:
-        raise RuntimeError(
-            f"Only {len(complete)} devices contain every selected sweep index {indices}"
-        )
-    incomplete = sorted(set(retained) - set(complete))
-    return complete, indices, incomplete, dict(sorted(counts.items()))
+def export_device_debug_data(report_dir, single_ids, multi_ids, single_results, multi_results):
+    """
+    Creates a CSV file summarizing each device's IDs and intra/inter Hamming results
+    for both single- and multi-sweep PCA.
+    """
+    device_list = sorted(set(single_ids.keys()) | set(multi_ids.keys()))
+    records = []
+    # Convert authentication results to dict for quick lookup
+    single_map = {r["Expected"]: r for r in single_results}
+    multi_map = {r["Expected"]: r for r in multi_results}
 
-
-def validate_panel_sweeps(device_files, sweep_indices):
-    problems = []
-    for device in sorted(device_files):
-        for index in sweep_indices:
-            path = device_files[device][index]
-            try:
-                frequency, _, _ = load_raw_sweep(path)
-                if frequency[0] > START_FREQ_HZ or frequency[-1] < END_FREQ_HZ:
-                    problems.append(
-                        f"{path}: available range {frequency[0]:.3f}-"
-                        f"{frequency[-1]:.3f} Hz"
-                    )
-            except Exception as exc:
-                problems.append(f"{path}: {exc}")
-            if len(problems) >= 10:
-                break
-        if len(problems) >= 10:
-            break
-    if problems:
-        raise RuntimeError(
-            "Sweep preflight failed. First problems:\n  - " + "\n  - ".join(problems)
-        )
-
-
-# PCA identifier construction and held-out authentication
-def binary_projection(projection, bit_length):
-    return (np.asarray(projection[:bit_length]) > 0).astype(np.uint8)
-
-
-def identifier_text(identifier):
-    return "".join(map(str, np.asarray(identifier, dtype=np.uint8).tolist()))
-
-
-def split_sensor_cohorts(device_files):
-    devices = np.asarray(sorted(device_files))
-    rng = np.random.default_rng(SENSOR_COHORT_SPLIT_SEED)
-    shuffled = devices.copy()
-    rng.shuffle(shuffled)
-    test_count = max(1, int(round(len(shuffled) * SENSOR_COHORT_TEST_FRACTION)))
-    test_devices = set(shuffled[:test_count])
-    train_devices = set(shuffled[test_count:])
-    return (
-        {device: device_files[device] for device in sorted(train_devices)},
-        {device: device_files[device] for device in sorted(test_devices)},
-    )
-
-
-def fit_enrollment_model(
-    pca_device_files, enrollment_device_files, training_indices, bit_length
-):
-    rows, labels = [], []
-    for device in sorted(pca_device_files):
-        for index in training_indices:
-            rows.append(load_sweep_vector(pca_device_files[device][index]))
-            labels.append(device)
-    matrix = np.vstack(rows)
-    maximum_rank = min(matrix.shape[0] - 1, matrix.shape[1])
-    if bit_length > maximum_rank:
-        raise RuntimeError(
-            f"A genuine {bit_length}-bit PCA identifier requires {bit_length} "
-            f"non-zero components, but this fold supports at most {maximum_rank}"
-        )
-
-    scaler = StandardScaler().fit(matrix)
-    standardised = scaler.transform(matrix)
-    pca = PCA(
-        n_components=bit_length,
-        svd_solver="auto",
-        random_state=PCA_RANDOM_SEED,
-    )
-    started = perf_counter()
-    projections = pca.fit_transform(standardised)
-    fit_seconds = perf_counter() - started
-
-    identifiers = {}
-    for device in sorted(enrollment_device_files):
-        device_rows = [
-            load_sweep_vector(enrollment_device_files[device][index])
-            for index in training_indices
-        ]
-        device_projection = pca.transform(scaler.transform(np.vstack(device_rows))).mean(axis=0)
-        identifiers[device] = binary_projection(device_projection, bit_length)
-
-    return identifiers, {
-        "scaler": scaler,
-        "pca": pca,
-        "bit_length": bit_length,
-        "training_indices": tuple(training_indices),
-        "pca_training_rows": len(rows),
-        "enrollment_rows": len(enrollment_device_files) * len(training_indices),
-        "pca_training_devices": len(pca_device_files),
-        "template_devices": len(enrollment_device_files),
-        "fit_seconds": fit_seconds,
-        "variance_explained": float(pca.explained_variance_ratio_.sum()),
-    }
-
-
-COMPARISON_COLUMNS = [
-    "Scenario",
-    "ID_Bits",
-    "Fold",
-    "Training_Indices",
-    "Authentication_Index",
-    "Query_Device",
-    "Claimed_Device",
-    "Genuine",
-    "Hamming_Distance",
-]
-
-
-def authenticate_fold(
-    scenario,
-    fold_name,
-    identifiers,
-    model,
-    device_files,
-    authentication_index,
-    threshold,
-    comparison_writer=None,
-):
-    template_devices = sorted(identifiers)
-    template_matrix = np.vstack([identifiers[device] for device in template_devices])
-    template_position = {device: position for position, device in enumerate(template_devices)}
-
-    query_rows, intra, inter = [], [], []
-    transform_seconds = 0.0
-    for device in template_devices:
-        vector = load_sweep_vector(device_files[device][authentication_index])
-        started = perf_counter()
-        projection = model["pca"].transform(
-            model["scaler"].transform(vector.reshape(1, -1))
-        )[0]
-        transform_seconds += perf_counter() - started
-        generated = binary_projection(projection, model["bit_length"])
-        distances = np.count_nonzero(template_matrix != generated, axis=1)
-        own_position = template_position[device]
-        own_distance = int(distances[own_position])
-        impostor_distances = np.delete(distances, own_position).astype(int)
-        nearest_distance = int(distances.min())
-        nearest_positions = np.flatnonzero(distances == nearest_distance)
-        unique_correct_identification = (
-            len(nearest_positions) == 1 and nearest_positions[0] == own_position
-        )
-        verification_accepted = own_distance <= threshold
-
-        intra.append(own_distance)
-        inter.extend(impostor_distances.tolist())
-        query_rows.append(
-            {
-                "Scenario": scenario,
-                "ID_Bits": model["bit_length"],
-                "Fold": fold_name,
-                "Training_Indices": ",".join(map(str, model["training_indices"])),
-                "Authentication_Index": authentication_index,
-                "Device": device,
-                "Intra_Hamming": own_distance,
-                "Mean_Impostor_Hamming": float(impostor_distances.mean()),
-                "Nearest_Distance": nearest_distance,
-                "Nearest_Tie_Count": len(nearest_positions),
-                "Verification_Accepted": verification_accepted,
-                "Identification_Correct": unique_correct_identification,
-                "Authenticated": verification_accepted
-                and unique_correct_identification,
-            }
-        )
-
-        if comparison_writer is not None:
-            for claimed_device, distance in zip(template_devices, distances):
-                comparison_writer.writerow(
-                    {
-                        "Scenario": scenario,
-                        "ID_Bits": model["bit_length"],
-                        "Fold": fold_name,
-                        "Training_Indices": ",".join(
-                            map(str, model["training_indices"])
-                        ),
-                        "Authentication_Index": authentication_index,
-                        "Query_Device": device,
-                        "Claimed_Device": claimed_device,
-                        "Genuine": claimed_device == device,
-                        "Hamming_Distance": int(distance),
-                    }
-                )
-
-    mean_transform_ms = 1000 * transform_seconds / len(template_devices)
-    return (
-        query_rows,
-        np.asarray(intra, dtype=int),
-        np.asarray(inter, dtype=int),
-        mean_transform_ms,
-    )
-
-
-# Statistics and reporting
-def distribution_summary(values, prefix):
-    values = np.asarray(values, dtype=float)
-    bit_length = globals().get("_CURRENT_BIT_LENGTH_FOR_NORMALIZATION", None)
-    normalized = {}
-    if bit_length:
-        normalized = {
-            f"{prefix}_Mean_Normalized": float(values.mean() / bit_length),
-            f"{prefix}_Std_Normalized": (
-                float(values.std(ddof=1) / bit_length) if len(values) > 1 else 0.0
-            ),
+    for dev in device_list:
+        rec = {
+            "Device": dev,
+            "Single_ID": single_ids.get(dev),
+            "Multi_ID": multi_ids.get(dev),
         }
-    return {
-        f"{prefix}_Mean": float(values.mean()),
-        **normalized,
-        f"{prefix}_Std": float(values.std(ddof=1)) if len(values) > 1 else 0.0,
-        f"{prefix}_Min": float(values.min()),
-        f"{prefix}_Q05": float(np.quantile(values, 0.05)),
-        f"{prefix}_Median": float(np.median(values)),
-        f"{prefix}_Q95": float(np.quantile(values, 0.95)),
-        f"{prefix}_Max": float(values.max()),
-        f"{prefix}_Count": int(len(values)),
+        s_res = single_map.get(dev, {})
+        m_res = multi_map.get(dev, {})
+        rec.update({
+            "Single_Intra_Hamming": s_res.get("Intra_Hamming"),
+            "Single_Match": s_res.get("Match"),
+            "Single_Predicted": s_res.get("Predicted"),
+            "Multi_Intra_Hamming": m_res.get("Intra_Hamming"),
+            "Multi_Match": m_res.get("Match"),
+            "Multi_Predicted": m_res.get("Predicted"),
+        })
+        records.append(rec)
+
+    out_path = os.path.join(report_dir, "device_debug_metrics.csv")
+    pd.DataFrame(records).to_csv(out_path, index=False)
+    print(f" Device debug data written to: {out_path}")
+
+# ---------------------------
+# Registration
+# ---------------------------
+
+def build_single_sweep_ids(device_files, reg_index):
+    train_vecs, device_order = [], []
+    for dev, files in sorted(device_files.items()):
+        if reg_index in files:
+            vec = load_sweep_vector(files[reg_index])
+            train_vecs.append(vec); device_order.append(dev)
+    if not train_vecs: raise RuntimeError(f"No reg sweeps at index {reg_index}")
+    X = np.vstack(train_vecs)
+    n_samples,n_features=X.shape
+    n_comp=choose_pca_components(n_samples,n_features)
+    fit_start = perf_counter()
+    scaler = StandardScaler().fit(X)
+    scaler_fit_seconds = perf_counter() - fit_start
+    first_start = perf_counter()
+    Xp = PCA(n_components=n_comp).fit_transform(scaler.transform(X))
+    first_fit_seconds = perf_counter() - first_start
+    binary_ids={device_order[i]:binary_from_projection(Xp[i],n_comp) for i in range(len(device_order))}
+    second_start = perf_counter()
+    stored_pca = PCA(n_components=n_comp).fit(scaler.transform(X))
+    second_fit_seconds = perf_counter() - second_start
+    timed_model = {
+        "scaler": scaler, "pca": stored_pca, "ref_freq": REF_FREQ,
+        "use_phase": USE_PHASE, "bit_length": n_comp,
+        "timing": {
+            "Scaler_Fit_Seconds": scaler_fit_seconds,
+            "Enrollment_PCA_Fit_Transform_Seconds": first_fit_seconds,
+            "Stored_PCA_Fit_Seconds": second_fit_seconds,
+            "Total_Fit_Seconds": scaler_fit_seconds + first_fit_seconds + second_fit_seconds,
+            "Training_Rows": n_samples, "Feature_Count": n_features,
+        },
     }
+    return device_order,binary_ids,timed_model
 
-
-def d_prime(intra, inter):
-    intra = np.asarray(intra, dtype=float)
-    inter = np.asarray(inter, dtype=float)
-    pooled = np.sqrt(0.5 * (intra.var(ddof=1) + inter.var(ddof=1)))
-    return float((inter.mean() - intra.mean()) / pooled) if pooled > 0 else np.inf
-
-
-def block_ranges(bit_length):
-    ranges = [(1, min(64, bit_length))]
-    if bit_length >= 128:
-        ranges.append((65, min(128, bit_length)))
-    if bit_length >= 256:
-        ranges.append((129, min(256, bit_length)))
-    return ranges
-
-
-def block_quality_summary(intra_blocks, inter_blocks, bit_length):
-    rows = []
-    for start, end in block_ranges(bit_length):
-        key = f"{start}_{end}"
-        intra = np.asarray(intra_blocks[key], dtype=float)
-        inter = np.asarray(inter_blocks[key], dtype=float)
-        block_bits = end - start + 1
-        rows.append(
-            {
-                "Bit_Block": f"{start}-{end}",
-                "Block_Bits": block_bits,
-                "Intra_Mean": float(intra.mean()),
-                "Intra_Mean_Normalized": float(intra.mean() / block_bits),
-                "Intra_Std": float(intra.std(ddof=1)) if len(intra) > 1 else 0.0,
-                "Intra_Min": float(intra.min()),
-                "Intra_Max": float(intra.max()),
-                "Inter_Mean": float(inter.mean()),
-                "Inter_Mean_Normalized": float(inter.mean() / block_bits),
-                "Inter_Std": float(inter.std(ddof=1)) if len(inter) > 1 else 0.0,
-                "Inter_Min": float(inter.min()),
-                "Inter_Max": float(inter.max()),
-                "D_Prime": d_prime(intra, inter),
-            }
-        )
-    return rows
-
-
-def error_statistics(intra, inter, bit_length, fixed_threshold):
-    intra, inter = np.asarray(intra), np.asarray(inter)
-    thresholds = np.arange(bit_length + 1)
-    far = np.asarray([(inter <= value).mean() for value in thresholds])
-    frr = np.asarray([(intra > value).mean() for value in thresholds])
-    eer_position = int(np.argmin(np.abs(far - frr)))
-    balanced = 0.5 * (far + frr)
-    minimum_position = int(np.argmin(balanced))
-
-    intra_hist = np.bincount(intra, minlength=bit_length + 1)[: bit_length + 1]
-    inter_hist = np.bincount(inter, minlength=bit_length + 1)[: bit_length + 1]
-    overlap = np.minimum(
-        intra_hist / intra_hist.sum(), inter_hist / inter_hist.sum()
-    ).sum()
-
-    return {
-        "Fixed_Threshold": int(fixed_threshold),
-        "FAR_At_Fixed_Threshold": float((inter <= fixed_threshold).mean()),
-        "FRR_At_Fixed_Threshold": float((intra > fixed_threshold).mean()),
-        "Descriptive_EER_Threshold": int(thresholds[eer_position]),
-        "Descriptive_EER": float(0.5 * (far[eer_position] + frr[eer_position])),
-        "Minimum_Balanced_Error_Threshold": int(thresholds[minimum_position]),
-        "Minimum_Balanced_Error": float(balanced[minimum_position]),
-        "Empirical_Overlap_Coefficient": float(overlap),
+def build_multi_sweep_ids(device_files, train_indices):
+    X,labels=[],[]
+    for dev,files in sorted(device_files.items()):
+        for idx in train_indices:
+            if idx in files:
+                vec=load_sweep_vector(files[idx]); X.append(vec); labels.append(dev)
+    if not X: raise RuntimeError("No multi-sweep data")
+    X=np.vstack(X); n_samples,n_features=X.shape
+    n_comp=choose_pca_components(n_samples,n_features)
+    fit_start = perf_counter()
+    scaler = StandardScaler().fit(X)
+    scaler_fit_seconds = perf_counter() - fit_start
+    first_start = perf_counter()
+    Xp = PCA(n_components=n_comp).fit_transform(scaler.transform(X))
+    first_fit_seconds = perf_counter() - first_start
+    binary_ids={}
+    for dev in sorted(set(labels)):
+        idxs=[i for i,l in enumerate(labels) if l==dev]
+        mean_proj=np.mean(Xp[idxs,:],axis=0)
+        binary_ids[dev]=binary_from_projection(mean_proj,n_comp)
+    second_start = perf_counter()
+    stored_pca = PCA(n_components=n_comp).fit(scaler.transform(X))
+    second_fit_seconds = perf_counter() - second_start
+    timed_model = {
+        "scaler": scaler, "pca": stored_pca, "ref_freq": REF_FREQ,
+        "use_phase": USE_PHASE, "bit_length": n_comp,
+        "timing": {
+            "Scaler_Fit_Seconds": scaler_fit_seconds,
+            "Enrollment_PCA_Fit_Transform_Seconds": first_fit_seconds,
+            "Stored_PCA_Fit_Seconds": second_fit_seconds,
+            "Total_Fit_Seconds": scaler_fit_seconds + first_fit_seconds + second_fit_seconds,
+            "Training_Rows": n_samples, "Feature_Count": n_features,
+        },
     }
+    return binary_ids,timed_model
 
+# ---------------------------
+# Authentication
+# ---------------------------
+def authenticate_files(model, binary_ids, device_files, test_index, threshold=None, excluded=None):
+    """
+    Authenticate each device's test sweep against the registered binary IDs.
+    threshold: maximum Hamming distance for a valid match
+    excluded: list of devices to skip
+    """
+    excluded = set(excluded or [])
+    scaler, pca, bit_length = model["scaler"], model["pca"], model["bit_length"]
+    results = []
+    flags = defaultdict(list)
+    intra, inter = [], []
 
-def bootstrap_device_mean(query_frame, column, repeats=BOOTSTRAP_REPEATS):
-    device_means = query_frame.groupby("Device")[column].mean().to_numpy(float)
-    estimate = float(device_means.mean())
-    if len(device_means) < 2 or repeats <= 0:
-        return estimate, np.nan, np.nan
-    seed_offset = sum(map(ord, column))
-    rng = np.random.default_rng(BOOTSTRAP_SEED + seed_offset)
-    draws = rng.choice(device_means, size=(repeats, len(device_means)), replace=True)
-    means = draws.mean(axis=1)
-    low, high = np.quantile(means, (0.025, 0.975))
-    return estimate, float(low), float(high)
+    for dev, files in sorted(device_files.items()):
+        if dev in excluded:
+            continue
+        if test_index not in files:
+            continue
 
+        vec = load_sweep_vector(files[test_index], ref_freq=model["ref_freq"], use_phase=model["use_phase"])
+        transform_start = perf_counter()
+        proj = pca.transform(scaler.transform(vec.reshape(1, -1)))[0]
+        transform_ms = 1000.0 * (perf_counter() - transform_start)
+        gen_bin = binary_from_projection(proj, bit_length)
+        reg_bin = binary_ids.get(dev)
+        intra_d = hamming_distance(gen_bin, reg_bin)
+        if intra_d is not None:
+            intra.append(intra_d)
 
-def plot_hamming(intra, inter, bit_length, scenario, output_path):
-    plt.figure(figsize=(7, 4.5))
-    upper = max(int(np.max(intra)), int(np.max(inter)), 1)
-    bins = np.linspace(0, upper, min(36, upper + 2))
-    plt.hist(inter, bins=bins, density=True, alpha=0.60, color="#1f77b4",
-             edgecolor="black", label="Inter-device HD")
-    plt.hist(intra, bins=bins, density=True, alpha=0.60, color="#d62728",
-             edgecolor="black", label="Intra-device HD")
-    plt.axvline(np.mean(inter), color="#1f77b4", linestyle="--")
-    plt.axvline(np.mean(intra), color="#d62728", linestyle="--")
-    plt.xlabel("Hamming distance")
-    plt.ylabel("Probability density")
-    plt.title(f"{scenario} PCA ({bit_length}-bit IDs, held-out sweeps)")
-    plt.grid(True, linestyle="--", alpha=0.45)
+        # Calculate inter distances
+        for o_dev, o_bin in binary_ids.items():
+            if o_dev != dev:
+                inter.append(hamming_distance(gen_bin, o_bin))
+
+        # Find best match
+        best, min_d = None, None
+        for o_dev, o_bin in binary_ids.items():
+            d = hamming_distance(gen_bin, o_bin)
+            if min_d is None or d < min_d:
+                min_d, best = d, o_dev
+
+        # Check authentication validity
+        match = (best == dev)
+        threshold_pass = (threshold is None) or (intra_d is not None and intra_d <= threshold)
+        success = match and threshold_pass
+
+        results.append({
+            "Transform_Milliseconds": transform_ms,
+            "File": os.path.basename(files[test_index]),
+            "Expected": dev,
+            "Predicted": best,
+            "Intra_Hamming": intra_d,
+            "Within_Threshold": threshold_pass,
+            "Match": match,
+            "Authenticated": success
+        })
+        flags[dev].append(success)
+
+    return results, flags, intra, inter
+
+# ---------------------------
+# Plot helpers (UPDATED)
+# ---------------------------
+
+def plot_combined_pdf(intra, inter, title, outpath):
+    plt.figure(figsize=(6, 4))
+
+    intra = np.array(intra)
+    inter = np.array(inter)
+
+    if len(intra) == 0 or len(inter) == 0:
+        return
+
+    max_val = max(inter.max(), intra.max())
+    bins = np.linspace(0, max_val, 25)
+
+    inter_color = '#1f77b4'   # blue
+    intra_color = '#d62728'   # red
+
+    # Inter
+    plt.hist(inter, bins=bins, density=True,
+             alpha=0.6, label="Inter-HD",
+             edgecolor='black', linewidth=0.8,
+             color=inter_color)
+
+    # Intra
+    plt.hist(intra, bins=bins, density=True,
+             alpha=0.6, label="Intra-HD",
+             edgecolor='black', linewidth=0.8,
+             color=intra_color)
+
+    # Means
+    plt.axvline(inter.mean(), linestyle='--', linewidth=2,
+                color=inter_color,
+                label=f'Inter Mean = {inter.mean():.2f}')
+
+    plt.axvline(intra.mean(), linestyle='--', linewidth=2,
+                color=intra_color,
+                label=f'Intra Mean = {intra.mean():.2f}')
+
+    plt.xlabel("Hamming Distance")
+    plt.ylabel("Probability Density")
+    plt.title(title)
     plt.legend()
+    plt.grid(True, linestyle='--', linewidth=0.5, alpha=0.6)
+
     plt.tight_layout()
-    plt.savefig(output_path, dpi=600, bbox_inches="tight")
+    plt.savefig(outpath, dpi=600, bbox_inches='tight')
     plt.close()
 
+# ---------------------------
+# Main
+# ---------------------------
 
-def run_scenario(
-    scenario, pca_device_files, enrollment_device_files, sweep_indices,
-    bit_length, threshold, report_dir, cohort_protocol
-):
-    global _CURRENT_BIT_LENGTH_FOR_NORMALIZATION
-    if scenario == "Single-sweep":
-        folds = [
-            (f"enroll_{train}_test_{test}", [train], test)
-            for train in sweep_indices
-            for test in sweep_indices
-            if train != test
-        ]
-    elif scenario == "Multi-sweep":
-        folds = [
-            (f"test_{test}", [index for index in sweep_indices if index != test], test)
-            for test in sweep_indices
-        ]
-    else:
-        raise ValueError(f"Unknown scenario: {scenario}")
+def run_all_tests(folder):
+    device_files=collect_device_files(folder)
+    print("Devices:",list(device_files.keys()))
 
-    slug = f"{cohort_protocol}_{scenario}".lower().replace("-", "_")
-    raw_path = os.path.join(
-        report_dir, f"{slug}_{bit_length}bit_directed_comparisons.csv.gz"
-    )
-    comparison_handle = None
-    comparison_writer = None
-    if EXPORT_DIRECTED_COMPARISONS:
-        comparison_handle = gzip.open(raw_path, "wt", newline="", encoding="utf-8")
-        comparison_writer = csv.DictWriter(
-            comparison_handle, fieldnames=COMPARISON_COLUMNS
+    # Single
+    order,bin_ids,model=build_single_sweep_ids(device_files,PREFERRED_REG_INDEX_SINGLE)
+    #single_results,flags_s,intra_s,inter_s=authenticate_files(model,bin_ids,device_files,PREFERRED_AUTH_INDEX_SINGLE)
+    
+    single_results, flags_s, intra_s, inter_s = authenticate_files(
+    model, bin_ids, device_files, PREFERRED_AUTH_INDEX_SINGLE,
+    threshold=HAMMING_AUTH_THRESHOLD, excluded=EXCLUDED_DEVICES)
+    if EXCLUDED_DEVICES:print(f" Excluded devices: {', '.join(EXCLUDED_DEVICES)}")
+
+
+    pd.DataFrame(single_results).to_csv(os.path.join(REPORT_DIR,"single_sweep_metrics.csv"),index=False)
+    plot_combined_pdf(
+    intra_s,
+    inter_s,
+    "Hamming Distance Distribution (Single-Sweep PCA)",
+    os.path.join(REPORT_DIR, "single_combined.png")
+)
+
+    total_reg_s=len(order); success_s=sum(1 for d in order if all(flags_s[d])); rate_s=success_s/total_reg_s*100 if total_reg_s else 0
+
+    # Multi
+    bin_ids_m,model_m=build_multi_sweep_ids(device_files,PREFERRED_MULTI_TRAIN_INDICES)
+    #multi_results,flags_m,intra_m,inter_m=authenticate_files(model_m,bin_ids_m,device_files,PREFERRED_MULTI_AUTH_INDEX)
+    multi_results, flags_m, intra_m, inter_m = authenticate_files(
+    model_m, bin_ids_m, device_files, PREFERRED_MULTI_AUTH_INDEX,
+    threshold=HAMMING_AUTH_THRESHOLD, excluded=EXCLUDED_DEVICES)
+    if EXCLUDED_DEVICES:print(f" Excluded devices: {', '.join(EXCLUDED_DEVICES)}")
+
+
+    pd.DataFrame(multi_results).to_csv(os.path.join(REPORT_DIR,"multi_sweep_metrics.csv"),index=False)
+    plot_combined_pdf(
+    intra_m,
+    inter_m,
+    "Hamming Distance Distribution (Multi-Sweep PCA)",
+    os.path.join(REPORT_DIR, "multi_combined.png")
+)
+
+    total_reg_m=len(bin_ids_m); success_m=sum(1 for d in bin_ids_m if all(flags_m[d])); rate_m=success_m/total_reg_m*100 if total_reg_m else 0
+
+    # Comparison
+    pd.DataFrame([
+        {"Scenario":"Single","Registered":total_reg_s,"Success":success_s,"Rate%":rate_s,"MeanIntra":np.mean(intra_s)},
+        {"Scenario":"Multi","Registered":total_reg_m,"Success":success_m,"Rate%":rate_m,"MeanIntra":np.mean(intra_m)},
+    ]).to_csv(os.path.join(REPORT_DIR,"comparison_summary.csv"),index=False)
+
+    # Timing only: measured once per executed fit and once per query.
+    timing_rows = []
+    for scenario, fitted, results in [
+        ("Single-sweep", model, single_results),
+        ("Multi-sweep", model_m, multi_results),
+    ]:
+        times = np.asarray([r["Transform_Milliseconds"] for r in results])
+        timing_rows.append({
+            "Scenario": scenario, "ID_Bits": fitted["bit_length"],
+            "Frequency_Start_Hz": START_FREQ, "Frequency_End_Hz": END_FREQ,
+            "Query_Count": len(times), **fitted["timing"],
+            "Mean_Transform_Milliseconds": float(times.mean()) if len(times) else np.nan,
+            "Median_Transform_Milliseconds": float(np.median(times)) if len(times) else np.nan,
+            "P95_Transform_Milliseconds": float(np.percentile(times, 95)) if len(times) else np.nan,
+        })
+    timing_frame = pd.DataFrame(timing_rows)
+    timing_frame.to_csv(os.path.join(REPORT_DIR, "pca_runtime_summary.csv"), index=False)
+    print(timing_frame.to_string(index=False))
+    with open(os.path.join(REPORT_DIR, "timing_notes.txt"), "w") as notes:
+        notes.write(
+            "Legacy implementation: two independent PCA fits are preserved.\n"
+            "Total_Fit_Seconds sums scaler fit and both PCA calls, including their scaler transforms.\n"
+            "Fit timing excludes CSV loading, interpolation and template construction.\n"
+            "Query timing includes StandardScaler.transform and PCA.transform only; excludes loading, "
+            "interpolation, binarization and matching. No warm-up or repeated timing trials.\n"
+            "These timings do not validate historical performance values.\n"
+            f"Multi-sweep enrollment indices: {PREFERRED_MULTI_TRAIN_INDICES}; "
+            f"authentication index: {PREFERRED_MULTI_AUTH_INDEX}.\n"
+            f"Authentication threshold: {HAMMING_AUTH_THRESHOLD} bits.\n"
         )
-        comparison_writer.writeheader()
 
-    all_intra, all_inter = [], []
-    query_rows, fold_rows, identifier_rows, bit_quality_rows = [], [], [], []
-    intra_blocks = {f"{start}_{end}": [] for start, end in block_ranges(bit_length)}
-    inter_blocks = {f"{start}_{end}": [] for start, end in block_ranges(bit_length)}
-    try:
-        for fold_name, training_indices, test_index in folds:
-            identifiers, model = fit_enrollment_model(
-                pca_device_files, enrollment_device_files, training_indices, bit_length
-            )
-            fold_queries, fold_intra, fold_inter, mean_transform_ms = authenticate_fold(
-                scenario, fold_name, identifiers, model, enrollment_device_files,
-                test_index, threshold, comparison_writer
-            )
-            for row in fold_queries:
-                row["Cohort_Protocol"] = cohort_protocol
-                row["Intra_Hamming_Normalized"] = (
-                    row["Intra_Hamming"] / bit_length
-                )
-                row["Mean_Impostor_Hamming_Normalized"] = (
-                    row["Mean_Impostor_Hamming"] / bit_length
-                )
-            query_rows.extend(fold_queries)
-            all_intra.append(fold_intra)
-            all_inter.append(fold_inter)
+    # data debug
+    export_device_debug_data(REPORT_DIR, bin_ids, bin_ids_m, single_results, multi_results)
 
-            _CURRENT_BIT_LENGTH_FOR_NORMALIZATION = bit_length
-            fold_metrics = {
-                "Scenario": scenario,
-                "Cohort_Protocol": cohort_protocol,
-                "ID_Bits": bit_length,
-                "Fold": fold_name,
-                "Training_Indices": ",".join(map(str, training_indices)),
-                "Authentication_Index": test_index,
-                "PCA_Training_Devices": model["pca_training_devices"],
-                "Template_Devices": model["template_devices"],
-                "Enrollment_Rows": model["enrollment_rows"],
-                "PCA_Training_Rows": model["pca_training_rows"],
-                "Fit_Seconds": model["fit_seconds"],
-                "Mean_Transform_Milliseconds": mean_transform_ms,
-                "Directed_Impostor_Comparisons": len(fold_inter),
-                "Variance_Explained_By_ID_Components": model["variance_explained"],
-                **distribution_summary(fold_intra, "Intra"),
-                **distribution_summary(fold_inter, "Inter"),
-                **error_statistics(fold_intra, fold_inter, bit_length, threshold),
-            }
-            _CURRENT_BIT_LENGTH_FOR_NORMALIZATION = None
-            fold_metrics["Separation_Score"] = (
-                fold_metrics["Inter_Mean"] - fold_metrics["Intra_Mean"]
-            )
-            fold_metrics["D_Prime"] = d_prime(fold_intra, fold_inter)
-            fold_rows.append(fold_metrics)
+    # Markdown report
+    with open(os.path.join(REPORT_DIR,"Final_Results.md"),"w") as f:
+        f.write("# Final Results Report\n\n")
+        f.write("## What are intra vs inter Hamming graphs?\n")
+        f.write("- **Intra-device distances**: Hamming distance between a regenerated ID (at authentication) and its *own* registered ID.\n")
+        f.write("  These show how stable/reproducible each device’s ID is over time.\n")
+        f.write("- **Inter-device distances**: Hamming distances between a regenerated ID and *all other devices’* registered IDs.\n")
+        f.write("  These show how well-separated the devices are (uniqueness).\n\n")
+        f.write("Ideally: intra distances are low (close to 0), while inter distances are high (close to half the ID length).\n\n")
 
-            template_devices = sorted(identifiers)
-            templates = np.vstack([identifiers[device] for device in template_devices])
-            positions = {device: position for position, device in enumerate(template_devices)}
-            fold_intra_blocks = {key: [] for key in intra_blocks}
-            fold_inter_blocks = {key: [] for key in inter_blocks}
-            for device in template_devices:
-                vector = load_sweep_vector(enrollment_device_files[device][test_index])
-                projection = model["pca"].transform(
-                    model["scaler"].transform(vector.reshape(1, -1))
-                )[0]
-                generated = binary_projection(projection, bit_length)
-                own = positions[device]
-                for start, end in block_ranges(bit_length):
-                    key = f"{start}_{end}"
-                    segment = slice(start - 1, end)
-                    distances = np.count_nonzero(
-                        templates[:, segment] != generated[segment], axis=1
-                    )
-                    own_distance = int(distances[own])
-                    impostor = np.delete(distances, own).astype(int)
-                    intra_blocks[key].append(own_distance)
-                    inter_blocks[key].extend(impostor.tolist())
-                    fold_intra_blocks[key].append(own_distance)
-                    fold_inter_blocks[key].extend(impostor.tolist())
-            for row in block_quality_summary(
-                fold_intra_blocks, fold_inter_blocks, bit_length
-            ):
-                bit_quality_rows.append(
-                    {
-                        "Scenario": scenario,
-                        "Cohort_Protocol": cohort_protocol,
-                        "ID_Bits": bit_length,
-                        "Fold": fold_name,
-                        **row,
-                    }
-                )
+        f.write("## Single-sweep (5 -> 6)\n")
+        f.write(f"- Devices registered: **{total_reg_s}**\n- Successfully authenticated: **{success_s}**\n")
+        f.write(f"- Success rate: **{rate_s:.2f}%**\n- Mean intra Hamming: **{np.mean(intra_s):.2f}**\n\n")
+        f.write("### Plots\n")
+        f.write("![Single Intra](single_intra.png)\n\n")
+        f.write("![Single Inter](single_inter.png)\n\n")
 
-            for device, identifier in identifiers.items():
-                identifier_rows.append(
-                    {"Scenario": scenario, "Cohort_Protocol": cohort_protocol,
-                     "ID_Bits": bit_length,
-                     "Fold": fold_name, "Device": device,
-                     "Identifier": identifier_text(identifier)}
-                )
-    finally:
-        if comparison_handle is not None:
-            comparison_handle.close()
+        f.write("## Multi-sweep (1..6 -> 7)\n")
+        f.write(f"- Devices registered: **{total_reg_m}**\n- Successfully authenticated: **{success_m}**\n")
+        f.write(f"- Success rate: **{rate_m:.2f}%**\n- Mean intra Hamming: **{np.mean(intra_m):.2f}**\n\n")
+        f.write("### Plots\n")
+        f.write("![Multi Intra](multi_intra.png)\n\n")
+        f.write("![Multi Inter](multi_inter.png)\n\n")
 
-    intra = np.concatenate(all_intra)
-    inter = np.concatenate(all_inter)
-    query_frame = pd.DataFrame(query_rows)
-    _CURRENT_BIT_LENGTH_FOR_NORMALIZATION = bit_length
-    aggregate = {
-        "Cohort_Protocol": cohort_protocol,
-        "Scenario": scenario,
-        "ID_Bits": bit_length,
-        "Frequency_Start_Hz": START_FREQ_HZ,
-        "Frequency_End_Hz": END_FREQ_HZ,
-        "Frequency_Points": N_FREQ_POINTS,
-        "Input_Features": N_FREQ_POINTS * (2 if USE_PHASE else 1),
-        "PCA_Training_Devices": len(pca_device_files),
-        "Template_Devices": len(enrollment_device_files),
-        "Sweep_Indices": ",".join(map(str, sweep_indices)),
-        "Fold_Count": len(folds),
-        "Directed_Comparison_Definition": "query sweep versus every enrolled template",
-        "Mean_Fit_Seconds": float(
-            np.mean([row["Fit_Seconds"] for row in fold_rows])
-        ),
-        "Mean_Transform_Milliseconds": float(
-            np.mean([row["Mean_Transform_Milliseconds"] for row in fold_rows])
-        ),
-        **distribution_summary(intra, "Intra"),
-        **distribution_summary(inter, "Inter"),
-        **error_statistics(intra, inter, bit_length, threshold),
-        "Verification_Acceptance_Rate": float(
-            query_frame["Verification_Accepted"].mean()
-        ),
-        "Unique_Identification_Rate": float(
-            query_frame["Identification_Correct"].mean()
-        ),
-        "Combined_Authentication_Rate": float(query_frame["Authenticated"].mean()),
-    }
-    _CURRENT_BIT_LENGTH_FOR_NORMALIZATION = None
-    aggregate["Separation_Score"] = aggregate["Inter_Mean"] - aggregate["Intra_Mean"]
-    aggregate["Separation_Score_Normalized"] = (
-        aggregate["Inter_Mean_Normalized"] - aggregate["Intra_Mean_Normalized"]
-    )
-    aggregate["D_Prime"] = d_prime(intra, inter)
-    for column, name in (
-        ("Intra_Hamming", "Device_Bootstrap_Intra_Mean"),
-        ("Mean_Impostor_Hamming", "Device_Bootstrap_Inter_Mean"),
-        ("Verification_Accepted", "Device_Bootstrap_Verification_Rate"),
-        ("Identification_Correct", "Device_Bootstrap_Identification_Rate"),
-        ("Authenticated", "Device_Bootstrap_Combined_Authentication_Rate"),
-    ):
-        estimate, low, high = bootstrap_device_mean(query_frame, column)
-        aggregate[name] = estimate
-        aggregate[f"{name}_CI95_Low"] = low
-        aggregate[f"{name}_CI95_High"] = high
+    print(" Reports written to",REPORT_DIR)
 
-    per_device = (
-        query_frame.groupby(["Scenario", "Cohort_Protocol", "ID_Bits", "Device"], as_index=False)
-        .agg(
-            Authentication_Queries=("Device", "size"),
-            Intra_Mean=("Intra_Hamming", "mean"),
-            Intra_Min=("Intra_Hamming", "min"),
-            Intra_Max=("Intra_Hamming", "max"),
-            Verification_Rate=("Verification_Accepted", "mean"),
-            Identification_Rate=("Identification_Correct", "mean"),
-            Combined_Authentication_Rate=("Authenticated", "mean"),
-        )
-    )
-    plot_hamming(
-        intra, inter, bit_length, scenario,
-        os.path.join(report_dir, f"{slug}_{bit_length}bit_hamming.png")
-    )
-    for row in block_quality_summary(intra_blocks, inter_blocks, bit_length):
-        bit_quality_rows.append(
-            {
-                "Scenario": scenario,
-                "Cohort_Protocol": cohort_protocol,
-                "ID_Bits": bit_length,
-                "Fold": "aggregate",
-                **row,
-            }
-        )
-    return aggregate, fold_rows, query_frame, per_device, identifier_rows, bit_quality_rows
-
-
-def write_report(summary_frame, report_dir, indices, incomplete):
-    path = os.path.join(report_dir, "Final_Results.md")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("# Leakage-Free PCA Authentication Results\n\n")
-        handle.write(
-            f"The analysis used {N_FREQ_POINTS} linearly spaced points from "
-            f"{START_FREQ_HZ / 1000:g} kHz to {END_FREQ_HZ / 1000:g} kHz. "
-            "Each measured sweep was linearly interpolated onto that common grid "
-            "before standardization and PCA.\n\n"
-        )
-        handle.write(f"Held-out sweep indices: {indices}.\n\n")
-        if incomplete:
-            handle.write(
-                f"Devices removed for an incomplete sweep panel: {len(incomplete)}.\n\n"
-            )
-        handle.write(
-            "The configured authentication thresholds were fixed before held-out "
-            "comparisons. EER and minimum balanced error are descriptive summaries "
-            "of the held-out distributions, not operational thresholds. Inter-device "
-            "comparisons are directed query-versus-template comparisons; therefore "
-            "D devices produce D(D-1) impostor distances in each fold.\n\n"
-        )
-        handle.write(summary_frame.to_markdown(index=False))
-        handle.write("\n")
-
-
-def main():
-    device_files = collect_device_files(DEVICE_FOLDER)
-    if not device_files:
-        raise RuntimeError(f"No sweep CSV files were found in {DEVICE_FOLDER}")
-    panel, indices, incomplete, counts = prepare_complete_panel(device_files)
-    validate_panel_sweeps(panel, indices)
-
-    print(f"Sweep counts before complete-panel filtering: {counts}")
-    print(f"Held-out sweep indices: {indices}")
-    print(f"Evaluated devices: {len(panel)}")
-    print(f"Explicitly excluded devices: {sorted(EXCLUDED_DEVICES)}")
-    print(f"Incomplete-panel devices removed: {incomplete}")
-    print("Interpolation: linear onto one common linear frequency grid")
-    print("No authentication sweep is used to fit PCA or construct its fold's IDs")
-
-    aggregate_rows, fold_rows, query_frames, per_device_frames, identifier_rows = (
-        [], [], [], [], []
-    )
-    bit_quality_rows = []
-    protocols = [("enrolled_cohort", panel, panel)]
-    if ENABLE_SENSOR_COHORT_SPLIT:
-        train_panel, test_panel = split_sensor_cohorts(panel)
-        protocols.append(("heldout_sensor_cohort", train_panel, test_panel))
-        print(
-            "Sensor-level cohort split: "
-            f"{len(train_panel)} PCA-training devices, {len(test_panel)} held-out devices"
-        )
-    for bit_length in ID_BIT_LENGTHS:
-        if bit_length not in FIXED_AUTH_THRESHOLDS:
-            raise RuntimeError(f"No pre-specified threshold for {bit_length}-bit IDs")
-        for protocol, pca_panel, enrollment_panel in protocols:
-            for scenario in ("Single-sweep", "Multi-sweep"):
-                print(f"Running {protocol}: {scenario}, {bit_length}-bit IDs...")
-                (
-                    aggregate,
-                    folds,
-                    queries,
-                    per_device,
-                    identifiers,
-                    bit_quality,
-                ) = run_scenario(
-                    scenario, pca_panel, enrollment_panel, indices, bit_length,
-                    FIXED_AUTH_THRESHOLDS[bit_length], REPORT_DIR, protocol
-                )
-                aggregate_rows.append(aggregate)
-                fold_rows.extend(folds)
-                query_frames.append(queries)
-                per_device_frames.append(per_device)
-                identifier_rows.extend(identifiers)
-                bit_quality_rows.extend(bit_quality)
-
-    aggregate_frame = pd.DataFrame(aggregate_rows)
-    aggregate_frame.to_csv(
-        os.path.join(REPORT_DIR, "comparison_summary.csv"), index=False
-    )
-    pd.DataFrame(fold_rows).to_csv(
-        os.path.join(REPORT_DIR, "fold_results.csv"), index=False
-    )
-    pd.concat(query_frames, ignore_index=True).to_csv(
-        os.path.join(REPORT_DIR, "authentication_queries.csv"), index=False
-    )
-    pd.concat(per_device_frames, ignore_index=True).to_csv(
-        os.path.join(REPORT_DIR, "per_device_results.csv"), index=False
-    )
-    pd.DataFrame(identifier_rows).to_csv(
-        os.path.join(REPORT_DIR, "registered_identifiers.csv"), index=False
-    )
-    pd.DataFrame(bit_quality_rows).to_csv(
-        os.path.join(REPORT_DIR, "bit_block_quality.csv"), index=False
-    )
-    write_report(aggregate_frame, REPORT_DIR, indices, incomplete)
-    print(f"Reports written to {REPORT_DIR}")
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    run_all_tests(DEVICE_FOLDER)
